@@ -3907,6 +3907,8 @@ pub struct ChannelsConfig {
     pub nostr: Option<NostrConfig>,
     /// ClawdTalk voice channel configuration.
     pub clawdtalk: Option<crate::channels::clawdtalk::ClawdTalkConfig>,
+    /// Bridge channel for third-party system integration via WebSocket.
+    pub bridge: Option<BridgeConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -3999,6 +4001,10 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.clawdtalk.as_ref())),
                 self.clawdtalk.is_some(),
             ),
+            (
+                Box::new(ConfigWrapper::new(self.bridge.as_ref())),
+                self.bridge.is_some(),
+            ),
         ]
     }
 
@@ -4040,6 +4046,7 @@ impl Default for ChannelsConfig {
             qq: None,
             nostr: None,
             clawdtalk: None,
+            bridge: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
         }
     }
@@ -5511,6 +5518,37 @@ pub fn default_nostr_relays() -> Vec<String> {
         "wss://relay.primal.net".to_string(),
         "wss://relay.snort.social".to_string(),
     ]
+}
+
+/// Bridge channel configuration for third-party system integration via WebSocket.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BridgeConfig {
+    /// WebSocket server host. Default: `127.0.0.1` (localhost only).
+    #[serde(default = "default_bridge_host")]
+    pub host: String,
+    /// WebSocket server port.
+    pub port: u16,
+    /// Authentication token. Clients must send this in the auth handshake.
+    pub token: String,
+    /// Allowed sender IDs. Empty = deny all, `["*"]` = allow all.
+    #[serde(default)]
+    pub allowed_senders: Vec<String>,
+    /// Streaming mode for progressive message updates.
+    #[serde(default)]
+    pub stream_mode: StreamMode,
+}
+
+impl ChannelConfig for BridgeConfig {
+    fn name() -> &'static str {
+        "Bridge"
+    }
+    fn desc() -> &'static str {
+        "WebSocket bridge for third-party systems"
+    }
+}
+
+fn default_bridge_host() -> String {
+    "127.0.0.1".to_string()
 }
 
 // ── Config impl ──────────────────────────────────────────────────
@@ -8631,6 +8669,7 @@ default_temperature = 0.7
                 qq: None,
                 nostr: None,
                 clawdtalk: None,
+                bridge: None,
                 message_timeout_secs: 300,
             },
             memory: MemoryConfig::default(),
@@ -9559,6 +9598,7 @@ allowed_users = ["@ops:matrix.org"]
             qq: None,
             nostr: None,
             clawdtalk: None,
+            bridge: None,
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
@@ -9837,6 +9877,7 @@ channel_id = "C123"
             qq: None,
             nostr: None,
             clawdtalk: None,
+            bridge: None,
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
