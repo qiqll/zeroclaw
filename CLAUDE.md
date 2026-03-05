@@ -1,4 +1,6 @@
-# CLAUDE.md — ZeroClaw Agent Engineering Protocol
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 This file defines the default working protocol for Claude agents in this repository.
 Scope: entire repository.
@@ -25,6 +27,72 @@ Key extension points:
 - `src/observability/traits.rs` (`Observer`)
 - `src/runtime/traits.rs` (`RuntimeAdapter`)
 - `src/peripherals/traits.rs` (`Peripheral`) — hardware boards (STM32, RPi GPIO)
+
+Crate-level constraints: `#![forbid(unsafe_code)]` — no unsafe Rust anywhere. `#![warn(clippy::all, clippy::pedantic)]` with specific pedantic lints allowed (see `src/lib.rs` for the full allow-list).
+
+## 1.1) Build & Development Commands
+
+MSRV: **1.87**. Workspace: root crate `zeroclaw` + `crates/robot-kit`.
+
+```bash
+# Build (debug)
+cargo build
+
+# Build (release, optimized for size)
+cargo build --release
+
+# Run all tests
+cargo test
+
+# Run a single test by name
+cargo test <test_name>                          # e.g. cargo test test_config_load
+cargo test --test <integration_test_file>       # e.g. cargo test --test agent_e2e
+
+# Run tests in a specific module
+cargo test --lib <module>::                     # e.g. cargo test --lib providers::
+
+# Format check
+cargo fmt --all -- --check
+
+# Lint (correctness-only, used by default CI gate)
+cargo clippy --locked --all-targets -- -D clippy::correctness
+
+# Lint (strict, all warnings denied — used by strict CI gate)
+cargo clippy --locked --all-targets -- -D warnings
+
+# Quality gate script (fmt + correctness clippy)
+./scripts/ci/rust_quality_gate.sh
+
+# Quality gate strict mode (fmt + full clippy warnings)
+./scripts/ci/rust_quality_gate.sh --strict
+
+# Full local CI in Docker (lint, test, build, security, docker-smoke)
+./dev/ci.sh all
+
+# Run benchmarks
+cargo bench --bench agent_benchmarks
+
+# Enable pre-push hook
+git config core.hooksPath .githooks
+```
+
+**Feature flags** (most are off by default; `wasm-tools` is the only default feature):
+
+- `hardware` — USB/serial peripheral support (nusb + tokio-serial)
+- `channel-matrix` — Matrix channel (matrix-sdk)
+- `channel-lark` — Lark/Feishu channel (prost)
+- `browser-native` — Rust-native browser automation (fantoccini)
+- `runtime-wasm` — In-process WASM sandbox (wasmi)
+- `wasm-tools` — WASM plugin engine (wasmtime + wasmtime-wasi) **(default)**
+- `whatsapp-web` — Native WhatsApp Web client (wa-rs)
+- `observability-otel` — OpenTelemetry trace + metrics export
+- `peripheral-rpi` — Raspberry Pi GPIO (rppal, Linux only)
+- `sandbox-landlock` — Landlock sandbox (Linux only)
+- `probe` — probe-rs for STM32/Nucleo memory read
+- `rag-pdf` — PDF extraction for datasheet RAG
+- `memory-postgres` — PostgreSQL memory backend
+
+Build with specific features: `cargo build --features "hardware,browser-native"`
 
 ## 2) Deep Architecture Observations (Why This Protocol Exists)
 
@@ -132,20 +200,36 @@ Required:
 
 ## 4) Repository Map (High-Level)
 
-- `src/main.rs` — CLI entrypoint and command routing
+- `src/main.rs` — CLI entrypoint and command routing (clap `Commands` enum)
 - `src/lib.rs` — module exports and shared command enums
-- `src/config/` — schema + config loading/merging
+- `src/config/` — schema + config loading/merging (`schema.rs` is the config struct)
 - `src/agent/` — orchestration loop
-- `src/gateway/` — webhook/gateway server
-- `src/security/` — policy, pairing, secret store
+  - `agent.rs` / `AgentBuilder` — agent construction
+  - `loop_.rs` — core message loop, tool-call parsing, history compaction
+  - `loop_/context.rs` — system prompt + context assembly
+  - `loop_/execution.rs` — sequential/parallel tool execution
+  - `loop_/detection.rs` — loop detection to prevent runaway tool calls
+  - `research.rs` — proactive research phase before response
+- `src/gateway/` — webhook/gateway server (axum-based HTTP + WebSocket)
+- `src/security/` — policy, pairing, secret store, autonomy levels
 - `src/memory/` — markdown/sqlite memory backends + embeddings/vector merge
-- `src/providers/` — model providers and resilient wrapper
-- `src/channels/` — Telegram/Discord/Slack/etc channels
-- `src/tools/` — tool execution surface (shell, file, memory, browser)
+- `src/providers/` — model providers (factory in `mod.rs` → `create_provider`)
+  - `reliable.rs` — `ReliableProvider` wrapper with fallback chains + retry
+  - `router.rs` — model routing across multiple providers
+- `src/channels/` — messaging platforms (factory in `mod.rs` → `start_channels`)
+- `src/tools/` — tool execution surface (registry in `mod.rs` → `all_tools`)
 - `src/peripherals/` — hardware peripherals (STM32, RPi GPIO); see `docs/hardware-peripherals-design.md`
 - `src/runtime/` — runtime adapters (currently native)
-- `docs/` — task-oriented documentation system (hubs, unified TOC, references, operations, security proposals, multilingual guides)
+- `src/plugins/` — WASM plugin system
+- `crates/robot-kit/` — separate crate for robot/hardware kit utilities
+- `tests/` — integration tests (agent e2e, channel routing, config, circuit breaker, etc.)
+- `benches/` — criterion benchmarks (`agent_benchmarks.rs`)
+- `docs/` — task-oriented documentation system
 - `.github/` — CI, templates, automation workflows
+- `dev/` — local Docker CI (`ci.sh`), config templates, sandbox configs
+- `scripts/ci/` — CI scripts (quality gates, security, docs checks)
+
+**Key data flow** (agent loop): `main.rs` → `agent::run()` → `loop_::run()` builds system prompt via `context.rs`, calls `Provider::chat()`, parses tool calls via `parsing.rs`, executes tools via `execution.rs` (respecting `SecurityPolicy`), appends results to history, and loops until no more tool calls. Channels (`start_channels`) run the same loop per incoming message with per-sender conversation history.
 
 ## 4.1 Documentation System Contract (Required)
 

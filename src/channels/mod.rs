@@ -14,6 +14,7 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
+pub mod bridge;
 pub mod clawdtalk;
 pub mod cli;
 pub mod dingtalk;
@@ -42,6 +43,7 @@ pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
 
+pub use bridge::BridgeChannel;
 pub use clawdtalk::ClawdTalkChannel;
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
@@ -4841,6 +4843,21 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "ClawdTalk",
             channel: Arc::new(ClawdTalkChannel::new(ct.clone())),
+        });
+    }
+
+    if let Some(ref br) = config.channels_config.bridge {
+        channels.push(ConfiguredChannel {
+            display_name: "Bridge",
+            channel: Arc::new(BridgeChannel::new(
+                br.host.clone(),
+                br.port,
+                br.token.clone(),
+                &br.allowed_senders,
+                br.stream_mode,
+                br.max_connections,
+                br.allow_public_bind,
+            )),
         });
     }
 
