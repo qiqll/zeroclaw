@@ -5536,6 +5536,13 @@ pub struct BridgeConfig {
     /// Streaming mode for progressive message updates.
     #[serde(default)]
     pub stream_mode: StreamMode,
+    /// Maximum number of concurrent WebSocket connections. Default: 64.
+    #[serde(default = "default_bridge_max_connections")]
+    pub max_connections: u16,
+    /// Allow binding to non-localhost addresses. Default: false.
+    /// Setting this to `true` exposes the bridge to the network — use with caution.
+    #[serde(default)]
+    pub allow_public_bind: bool,
 }
 
 impl ChannelConfig for BridgeConfig {
@@ -5549,6 +5556,10 @@ impl ChannelConfig for BridgeConfig {
 
 fn default_bridge_host() -> String {
     "127.0.0.1".to_string()
+}
+
+fn default_bridge_max_connections() -> u16 {
+    64
 }
 
 // ── Config impl ──────────────────────────────────────────────────

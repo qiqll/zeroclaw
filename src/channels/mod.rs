@@ -4855,6 +4855,8 @@ fn collect_configured_channels(
                 br.token.clone(),
                 &br.allowed_senders,
                 br.stream_mode,
+                br.max_connections,
+                br.allow_public_bind,
             )),
         });
     }

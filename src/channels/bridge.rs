@@ -17,13 +17,14 @@
 
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use crate::config::schema::StreamMode;
-use crate::security::pairing::constant_time_eq;
+use crate::security::pairing::{constant_time_eq, is_public_bind};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -35,8 +36,8 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 enum AllowList {
     /// `"*"` — accept messages from any sender.
     Any,
-    /// Accept only these specific sender IDs. Empty vec = deny-all.
-    Set(Vec<String>),
+    /// Accept only these specific sender IDs. Empty set = deny-all.
+    Set(HashSet<String>),
 }
 
 impl AllowList {
@@ -44,14 +45,14 @@ impl AllowList {
         if raw.iter().any(|s| s == "*") {
             Self::Any
         } else {
-            Self::Set(raw.to_vec())
+            Self::Set(raw.iter().cloned().collect())
         }
     }
 
     fn is_allowed(&self, sender_id: &str) -> bool {
         match self {
             Self::Any => true,
-            Self::Set(ids) => ids.iter().any(|id| id == sender_id),
+            Self::Set(ids) => ids.contains(sender_id),
         }
     }
 }
@@ -145,7 +146,7 @@ enum OutboundFrame<'a> {
 
 /// Write-half handle for one authenticated WS connection.
 struct ConnectionHandle {
-    tx: tokio::sync::mpsc::UnboundedSender<String>,
+    tx: tokio::sync::mpsc::Sender<String>,
 }
 
 // ── BridgeChannel ────────────────────────────────────────────────
@@ -157,6 +158,8 @@ pub struct BridgeChannel {
     token: String,
     allowed: AllowList,
     stream_mode: StreamMode,
+    max_connections: u16,
+    allow_public_bind: bool,
     /// connection_id (UUID) → write handle.
     connections: Arc<RwLock<HashMap<String, ConnectionHandle>>>,
     /// sender_id → connection_id routing table.
@@ -170,6 +173,8 @@ impl BridgeChannel {
         token: String,
         allowed_senders: &[String],
         stream_mode: StreamMode,
+        max_connections: u16,
+        allow_public_bind: bool,
     ) -> Self {
         Self {
             host,
@@ -177,6 +182,8 @@ impl BridgeChannel {
             token,
             allowed: AllowList::parse(allowed_senders),
             stream_mode,
+            max_connections,
+            allow_public_bind,
             connections: Arc::new(RwLock::new(HashMap::new())),
             sender_routing: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -194,7 +201,7 @@ impl BridgeChannel {
 
         let conns = self.connections.read().await;
         if let Some(handle) = conns.get(&conn_id) {
-            if handle.tx.send(json.to_owned()).is_err() {
+            if handle.tx.try_send(json.to_owned()).is_err() {
                 drop(conns);
                 self.remove_connection(&conn_id).await;
                 anyhow::bail!("Bridge connection closed for sender {sender_id}");
@@ -237,12 +244,25 @@ impl Channel for BridgeChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+        // ── H3: Refuse public bind without explicit opt-in ──
+        if is_public_bind(&self.host) && !self.allow_public_bind {
+            anyhow::bail!(
+                "Bridge: refusing to bind to {} — would be exposed to the network.\n\
+                 Fix: use host = \"127.0.0.1\" (default) or set allow_public_bind = true \
+                 in [channels.bridge] (NOT recommended).",
+                self.host
+            );
+        }
+
         let addr = format!("{}:{}", self.host, self.port);
         let listener = TcpListener::bind(&addr)
             .await
             .with_context(|| format!("Bridge: failed to bind {addr}"))?;
 
         tracing::info!("Bridge channel listening on {addr}");
+
+        // ── H2: Limit concurrent connections via semaphore ──
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_connections.into()));
 
         loop {
             let (stream, peer) = match listener.accept().await {
@@ -253,15 +273,19 @@ impl Channel for BridgeChannel {
                 }
             };
 
-            tracing::debug!("Bridge: new TCP connection from {peer}");
-
-            let ws_stream = match tokio_tungstenite::accept_async(stream).await {
-                Ok(ws) => ws,
-                Err(e) => {
-                    tracing::warn!("Bridge: WS upgrade failed from {peer}: {e}");
+            let permit = match semaphore.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!(
+                        "Bridge: max connections ({}) reached, rejecting {peer}",
+                        self.max_connections
+                    );
+                    drop(stream);
                     continue;
                 }
             };
+
+            tracing::debug!("Bridge: new TCP connection from {peer}");
 
             let conn_id = uuid::Uuid::new_v4().to_string();
             let token = self.token.clone();
@@ -271,6 +295,25 @@ impl Channel for BridgeChannel {
             let tx = tx.clone();
 
             tokio::spawn(async move {
+                // Perform WS upgrade inside spawn with timeout so a slow
+                // handshake cannot block the accept loop.
+                let ws_stream = match tokio::time::timeout(
+                    WS_UPGRADE_TIMEOUT,
+                    tokio_tungstenite::accept_async(stream),
+                )
+                .await
+                {
+                    Ok(Ok(ws)) => ws,
+                    Ok(Err(e)) => {
+                        tracing::warn!("Bridge: WS upgrade failed from {peer}: {e}");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::warn!("Bridge: WS upgrade timed out from {peer}");
+                        return;
+                    }
+                };
+
                 if let Err(e) = handle_connection(
                     ws_stream,
                     conn_id.clone(),
@@ -284,12 +327,17 @@ impl Channel for BridgeChannel {
                 {
                     tracing::debug!("Bridge: connection {conn_id} ended: {e}");
                 }
-                // Cleanup on disconnect.
+                // Cleanup: handle_connection already removes the connection
+                // handle to trigger graceful writer shutdown. The remove
+                // here is defensive (covers early-exit / panic paths) and
+                // is idempotent (HashMap::remove on a missing key is a no-op).
                 connections.write().await.remove(&conn_id);
                 sender_routing
                     .write()
                     .await
                     .retain(|_, cid| cid.as_str() != conn_id);
+                // Drop the semaphore permit to allow new connections.
+                drop(permit);
             });
         }
     }
@@ -349,12 +397,7 @@ impl Channel for BridgeChannel {
         Ok(None)
     }
 
-    async fn finalize_draft(
-        &self,
-        recipient: &str,
-        message_id: &str,
-        text: &str,
-    ) -> Result<()> {
+    async fn finalize_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
         let frame = OutboundFrame::DraftFinalize {
             draft_id: message_id,
             content: text,
@@ -388,12 +431,7 @@ impl Channel for BridgeChannel {
         self.send_frame(recipient, &frame).await
     }
 
-    async fn add_reaction(
-        &self,
-        channel_id: &str,
-        message_id: &str,
-        emoji: &str,
-    ) -> Result<()> {
+    async fn add_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> Result<()> {
         let frame = OutboundFrame::ReactionAdd {
             channel_id,
             message_id,
@@ -402,18 +440,20 @@ impl Channel for BridgeChannel {
         // Reactions are broadcast to all connections since they aren't sender-specific.
         let json = serde_json::to_string(&frame)?;
         let conns = self.connections.read().await;
-        for handle in conns.values() {
-            let _ = handle.tx.send(json.clone());
+        let mut stale: Vec<String> = Vec::new();
+        for (conn_id, handle) in conns.iter() {
+            if handle.tx.try_send(json.clone()).is_err() {
+                stale.push(conn_id.clone());
+            }
+        }
+        drop(conns);
+        for conn_id in &stale {
+            self.remove_connection(conn_id).await;
         }
         Ok(())
     }
 
-    async fn remove_reaction(
-        &self,
-        channel_id: &str,
-        message_id: &str,
-        emoji: &str,
-    ) -> Result<()> {
+    async fn remove_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> Result<()> {
         let frame = OutboundFrame::ReactionRemove {
             channel_id,
             message_id,
@@ -421,14 +461,31 @@ impl Channel for BridgeChannel {
         };
         let json = serde_json::to_string(&frame)?;
         let conns = self.connections.read().await;
-        for handle in conns.values() {
-            let _ = handle.tx.send(json.clone());
+        let mut stale: Vec<String> = Vec::new();
+        for (conn_id, handle) in conns.iter() {
+            if handle.tx.try_send(json.clone()).is_err() {
+                stale.push(conn_id.clone());
+            }
+        }
+        drop(conns);
+        for conn_id in &stale {
+            self.remove_connection(conn_id).await;
         }
         Ok(())
     }
 }
 
 // ── Per-connection task ──────────────────────────────────────────
+
+/// Timeout for the WebSocket upgrade handshake (TCP → WS).
+const WS_UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Auth handshake timeout.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Outbound message queue size per connection. If the queue fills up
+/// (WS writer cannot keep pace), new messages are dropped.
+const OUTBOUND_QUEUE_SIZE: usize = 1024;
 
 /// Drive one WebSocket connection: authenticate, then relay messages.
 async fn handle_connection(
@@ -442,42 +499,53 @@ async fn handle_connection(
 ) -> Result<()> {
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
-    // ── Authentication handshake ─────────────────────────────────
-    let auth_ok = loop {
-        let msg = ws_rx
-            .next()
-            .await
-            .context("Bridge: connection closed before auth")?
-            .context("Bridge: WS read error during auth")?;
+    // ── Authentication handshake (H1: with timeout) ─────────────
+    let auth_result = tokio::time::timeout(AUTH_TIMEOUT, async {
+        loop {
+            let msg = ws_rx
+                .next()
+                .await
+                .context("Bridge: connection closed before auth")?
+                .context("Bridge: WS read error during auth")?;
 
-        let text = match msg {
-            WsMessage::Text(t) => t.to_string(),
-            WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
-            WsMessage::Close(_) => anyhow::bail!("Bridge: client closed during auth"),
-            _ => continue,
-        };
+            let text = match msg {
+                WsMessage::Text(t) => t.to_string(),
+                WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
+                WsMessage::Close(_) => anyhow::bail!("Bridge: client closed during auth"),
+                _ => continue,
+            };
 
-        let frame: InboundFrame =
-            serde_json::from_str(&text).context("Bridge: invalid JSON during auth")?;
+            let frame: InboundFrame =
+                serde_json::from_str(&text).context("Bridge: invalid JSON during auth")?;
 
-        match frame {
-            InboundFrame::Auth { token } => {
-                break constant_time_eq(&token, &expected_token);
+            match frame {
+                InboundFrame::Auth { token } => {
+                    break Ok(constant_time_eq(&token, &expected_token));
+                }
+                InboundFrame::Ping => {
+                    let pong = serde_json::to_string(&OutboundFrame::Pong)?;
+                    ws_tx.send(WsMessage::Text(pong.into())).await?;
+                    continue;
+                }
+                _ => {
+                    // Non-auth message before authentication — reject.
+                    let reject = serde_json::to_string(&OutboundFrame::AuthResult {
+                        success: false,
+                        error: Some("auth required as first message"),
+                    })?;
+                    ws_tx.send(WsMessage::Text(reject.into())).await?;
+                    anyhow::bail!("Bridge: non-auth message received before authentication");
+                }
             }
-            InboundFrame::Ping => {
-                let pong = serde_json::to_string(&OutboundFrame::Pong)?;
-                ws_tx.send(WsMessage::Text(pong.into())).await?;
-                continue;
-            }
-            _ => {
-                // Non-auth message before authentication — reject.
-                let reject = serde_json::to_string(&OutboundFrame::AuthResult {
-                    success: false,
-                    error: Some("auth required as first message"),
-                })?;
-                ws_tx.send(WsMessage::Text(reject.into())).await?;
-                anyhow::bail!("Bridge: non-auth message received before authentication");
-            }
+        }
+    })
+    .await;
+
+    let auth_ok = match auth_result {
+        Ok(inner) => inner?,
+        Err(_) => {
+            tracing::warn!("Bridge: auth timeout for connection {conn_id}");
+            anyhow::bail!("Bridge: auth handshake timed out");
         }
     };
 
@@ -498,7 +566,7 @@ async fn handle_connection(
     tracing::info!("Bridge: connection {conn_id} authenticated");
 
     // ── Register connection ──────────────────────────────────────
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(OUTBOUND_QUEUE_SIZE);
     connections
         .write()
         .await
@@ -511,6 +579,8 @@ async fn handle_connection(
                 break;
             }
         }
+        // Attempt graceful WS close frame when the channel drains.
+        let _ = ws_tx.close().await;
     });
 
     // ── Message loop ─────────────────────────────────────────────
@@ -540,7 +610,7 @@ async fn handle_connection(
                 })?;
                 let conns = connections.read().await;
                 if let Some(handle) = conns.get(&conn_id) {
-                    let _ = handle.tx.send(err_frame);
+                    let _ = handle.tx.try_send(err_frame);
                 }
                 continue;
             }
@@ -565,7 +635,7 @@ async fn handle_connection(
                     })?;
                     let conns = connections.read().await;
                     if let Some(handle) = conns.get(&conn_id) {
-                        let _ = handle.tx.send(err_frame);
+                        let _ = handle.tx.try_send(err_frame);
                     }
                     continue;
                 }
@@ -635,13 +705,16 @@ async fn handle_connection(
                 let pong = serde_json::to_string(&OutboundFrame::Pong)?;
                 let conns = connections.read().await;
                 if let Some(handle) = conns.get(&conn_id) {
-                    let _ = handle.tx.send(pong);
+                    let _ = handle.tx.try_send(pong);
                 }
             }
         }
     }
 
-    writer.abort();
+    // ── M2: Graceful shutdown — remove connection handle (drops sender),
+    //    then wait for writer to flush and send WS close frame. ──
+    connections.write().await.remove(&conn_id);
+    let _ = writer.await;
     Ok(())
 }
 
@@ -701,8 +774,7 @@ mod tests {
 
     #[test]
     fn inbound_message_with_thread_deserializes() {
-        let json =
-            r#"{"type":"message","content":"hi","sender_id":"user_a","thread_id":"t-1"}"#;
+        let json = r#"{"type":"message","content":"hi","sender_id":"user_a","thread_id":"t-1"}"#;
         let frame: InboundFrame = serde_json::from_str(json).unwrap();
         assert!(
             matches!(frame, InboundFrame::Message { thread_id, .. } if thread_id.as_deref() == Some("t-1"))
@@ -711,8 +783,7 @@ mod tests {
 
     #[test]
     fn inbound_approval_response_deserializes() {
-        let json =
-            r#"{"type":"approval_response","request_id":"r1","approved":true,"sender_id":"user_a"}"#;
+        let json = r#"{"type":"approval_response","request_id":"r1","approved":true,"sender_id":"user_a"}"#;
         let frame: InboundFrame = serde_json::from_str(json).unwrap();
         assert!(
             matches!(frame, InboundFrame::ApprovalResponse { request_id, approved, sender_id } if request_id == "r1" && approved && sender_id == "user_a")
@@ -828,63 +899,328 @@ mod tests {
 
     // ── BridgeChannel construction ───────────────────────────────
 
+    /// Helper to create a `BridgeChannel` with defaults for test use.
+    fn test_channel(token: &str, allowed: &[String]) -> BridgeChannel {
+        BridgeChannel::new(
+            "127.0.0.1".to_string(),
+            0, // port irrelevant for unit tests
+            token.to_string(),
+            allowed,
+            StreamMode::Off,
+            64,
+            false,
+        )
+    }
+
     #[test]
     fn bridge_channel_name_is_bridge() {
-        let ch = BridgeChannel::new(
-            "127.0.0.1".to_string(),
-            9090,
-            "tok".to_string(),
-            &[],
-            StreamMode::Off,
-        );
+        let ch = test_channel("tok", &[]);
         assert_eq!(ch.name(), "bridge");
     }
 
     #[test]
     fn bridge_channel_draft_support_follows_stream_mode() {
-        let off = BridgeChannel::new(
-            "127.0.0.1".to_string(),
-            9090,
-            "tok".to_string(),
-            &[],
-            StreamMode::Off,
-        );
+        let off = test_channel("tok", &[]);
         assert!(!off.supports_draft_updates());
 
         let partial = BridgeChannel::new(
             "127.0.0.1".to_string(),
-            9090,
+            0,
             "tok".to_string(),
             &[],
             StreamMode::Partial,
+            64,
+            false,
         );
         assert!(partial.supports_draft_updates());
     }
 
     #[tokio::test]
     async fn health_check_false_with_no_connections() {
-        let ch = BridgeChannel::new(
-            "127.0.0.1".to_string(),
-            9090,
-            "tok".to_string(),
-            &[],
-            StreamMode::Off,
-        );
+        let ch = test_channel("tok", &[]);
         assert!(!ch.health_check().await);
     }
 
     #[tokio::test]
     async fn send_to_sender_fails_without_connection() {
+        let ch = test_channel("tok", &[]);
+        let result = ch.send(&SendMessage::new("hello", "user_a")).await;
+        assert!(result.is_err());
+    }
+
+    // ── H3: Public bind safety ──────────────────────────────────
+
+    #[tokio::test]
+    async fn listen_rejects_public_bind_without_opt_in() {
         let ch = BridgeChannel::new(
-            "127.0.0.1".to_string(),
-            9090,
+            "0.0.0.0".to_string(),
+            0,
             "tok".to_string(),
             &[],
             StreamMode::Off,
+            64,
+            false, // allow_public_bind = false
         );
-        let result = ch
-            .send(&SendMessage::new("hello", "user_a"))
-            .await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let result = ch.listen(tx).await;
         assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("refusing to bind"),
+            "Expected public-bind rejection, got: {err_msg}"
+        );
+    }
+
+    // ── Integration tests (H4) ──────────────────────────────────
+
+    /// Start a bridge listener on an ephemeral port and return the bound address.
+    async fn start_bridge_listener(
+        token: &str,
+        allowed: &[String],
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::mpsc::Receiver<ChannelMessage>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        // Bind to port 0 to get an ephemeral port.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let token = token.to_string();
+        let allowed = AllowList::parse(allowed);
+        let connections: Arc<RwLock<HashMap<String, ConnectionHandle>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let sender_routing: Arc<RwLock<HashMap<String, String>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+
+        let handle = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await?;
+            let ws_stream = tokio_tungstenite::accept_async(stream).await?;
+            let conn_id = "test-conn".to_string();
+            handle_connection(
+                ws_stream,
+                conn_id,
+                token,
+                allowed,
+                connections,
+                sender_routing,
+                tx,
+            )
+            .await
+        });
+
+        (addr, rx, handle)
+    }
+
+    #[tokio::test]
+    async fn auth_success_allows_messages() {
+        let allowed = vec!["user_a".to_string()];
+        let (addr, mut rx, _handle) = start_bridge_listener("test_token", &allowed).await;
+
+        let url = format!("ws://{addr}");
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        // Send auth.
+        let auth = r#"{"type":"auth","token":"test_token"}"#;
+        ws.send(WsMessage::Text(auth.into())).await.unwrap();
+
+        // Read auth_result.
+        let resp = ws.next().await.unwrap().unwrap();
+        let text = resp.into_text().unwrap();
+        assert!(
+            text.contains(r#""success":true"#),
+            "Expected auth success, got: {text}"
+        );
+
+        // Send a message.
+        let msg = r#"{"type":"message","content":"hello","sender_id":"user_a"}"#;
+        ws.send(WsMessage::Text(msg.into())).await.unwrap();
+
+        // Verify it arrives on the channel bus.
+        let channel_msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for message")
+            .expect("channel closed");
+        assert_eq!(channel_msg.content, "hello");
+        assert_eq!(channel_msg.sender, "bridge_user_a");
+
+        ws.close(None).await.ok();
+    }
+
+    #[tokio::test]
+    async fn auth_failure_closes_connection() {
+        let (addr, _rx, handle) = start_bridge_listener("correct_token", &[]).await;
+
+        let url = format!("ws://{addr}");
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        // Send wrong token.
+        let auth = r#"{"type":"auth","token":"wrong_token"}"#;
+        ws.send(WsMessage::Text(auth.into())).await.unwrap();
+
+        // Read auth_result — should be failure.
+        let resp = ws.next().await.unwrap().unwrap();
+        let text = resp.into_text().unwrap();
+        assert!(
+            text.contains(r#""success":false"#),
+            "Expected auth failure, got: {text}"
+        );
+
+        // The server-side handle_connection should return an error.
+        let result = handle.await.unwrap();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn auth_timeout_closes_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let connections: Arc<RwLock<HashMap<String, ConnectionHandle>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let sender_routing: Arc<RwLock<HashMap<String, String>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+
+        let handle = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.unwrap();
+            let ws_stream = tokio_tungstenite::accept_async(stream).await.unwrap();
+            handle_connection(
+                ws_stream,
+                "test-conn".to_string(),
+                "token".to_string(),
+                AllowList::Any,
+                connections,
+                sender_routing,
+                tx,
+            )
+            .await
+        });
+
+        let url = format!("ws://{addr}");
+        let (_ws, _resp) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        // Don't send any auth — wait for timeout.
+        // AUTH_TIMEOUT is 10s; use a generous deadline.
+        let result = tokio::time::timeout(Duration::from_secs(15), handle)
+            .await
+            .expect("handle_connection did not finish within 15s")
+            .unwrap();
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("timed out") || err_msg.contains("closed before auth"),
+            "Expected timeout error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthorized_sender_rejected() {
+        // Only allow "user_a".
+        let allowed = vec!["user_a".to_string()];
+        let (addr, mut rx, _handle) = start_bridge_listener("tok", &allowed).await;
+
+        let url = format!("ws://{addr}");
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        // Auth.
+        ws.send(WsMessage::Text(r#"{"type":"auth","token":"tok"}"#.into()))
+            .await
+            .unwrap();
+        let _ = ws.next().await; // consume auth_result
+
+        // Send message as unauthorized sender.
+        let msg = r#"{"type":"message","content":"hi","sender_id":"user_b"}"#;
+        ws.send(WsMessage::Text(msg.into())).await.unwrap();
+
+        // Read error frame.
+        let resp = ws.next().await.unwrap().unwrap();
+        let text = resp.into_text().unwrap();
+        assert!(
+            text.contains("sender not allowed"),
+            "Expected sender-rejected error, got: {text}"
+        );
+
+        // Verify nothing arrived on the channel bus.
+        let result = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "No message should reach the bus for unauthorized sender"
+        );
+
+        ws.close(None).await.ok();
+    }
+
+    #[tokio::test]
+    async fn connection_cleanup_on_disconnect() {
+        let connections: Arc<RwLock<HashMap<String, ConnectionHandle>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let sender_routing: Arc<RwLock<HashMap<String, String>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let conns = Arc::clone(&connections);
+        let routing = Arc::clone(&sender_routing);
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let allowed = vec!["user_a".to_string()];
+
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws_stream = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let conn_id = "cleanup-test".to_string();
+            let result = handle_connection(
+                ws_stream,
+                conn_id.clone(),
+                "tok".to_string(),
+                AllowList::parse(&allowed),
+                conns.clone(),
+                routing.clone(),
+                tx,
+            )
+            .await;
+            // Simulate the cleanup the listen() spawn block does.
+            conns.write().await.remove(&conn_id);
+            routing
+                .write()
+                .await
+                .retain(|_, cid| cid.as_str() != conn_id);
+            result
+        });
+
+        let url = format!("ws://{addr}");
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        // Auth + send a message to register routing.
+        ws.send(WsMessage::Text(r#"{"type":"auth","token":"tok"}"#.into()))
+            .await
+            .unwrap();
+        let _ = ws.next().await; // auth_result
+        ws.send(WsMessage::Text(
+            r#"{"type":"message","content":"hi","sender_id":"user_a"}"#.into(),
+        ))
+        .await
+        .unwrap();
+        // Small delay so the server processes the message.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Disconnect.
+        ws.close(None).await.ok();
+
+        // Wait for server handler to complete.
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+
+        // Verify cleanup.
+        assert!(
+            connections.read().await.is_empty(),
+            "connections should be empty after disconnect"
+        );
+        assert!(
+            sender_routing.read().await.is_empty(),
+            "sender_routing should be empty after disconnect"
+        );
     }
 }
