@@ -65,7 +65,7 @@ RUN size=$(stat -c%s /app/zeroclaw 2>/dev/null || stat -f%z /app/zeroclaw) && \
     if [ "$size" -lt 1000000 ]; then echo "ERROR: binary too small (${size} bytes), likely dummy build artifact" && exit 1; fi
 
 # Prepare runtime directory structure and default config inline (no extra stage)
-RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
+RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace/skills && \
     printf '%s\n' \
         'workspace_dir = "/zeroclaw-data/workspace"' \
         'config_path = "/zeroclaw-data/.zeroclaw/config.toml"' \
@@ -78,6 +78,10 @@ RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
         'port = 42617' \
         'host = "[::]"' \
         'allow_public_bind = true' \
+        '' \
+        '[skills]' \
+        'open_skills_enabled = false' \
+        'prompt_injection_mode = "full"' \
         > /zeroclaw-data/.zeroclaw/config.toml && \
     chown -R 65534:65534 /zeroclaw-data
 

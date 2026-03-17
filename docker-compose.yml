@@ -40,6 +40,8 @@ services:
     volumes:
       # Persist workspace and config (must match WORKDIR/HOME in Dockerfile)
       - zeroclaw-data:/zeroclaw-data
+      # Optional: mount local skills directory
+      # - ./skills:/zeroclaw-data/workspace/skills
       
     ports:
       # Gateway API port (override HOST_PORT if 42617 is taken)
